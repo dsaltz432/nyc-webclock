@@ -646,10 +646,10 @@ def notify_clock_out() -> None:
 
 def start_scheduler() -> None:
     scheduler = BackgroundScheduler(timezone=ET)
-    scheduler.add_job(notify_clock_in,  CronTrigger(hour=9,  minute=0, timezone=ET))
-    scheduler.add_job(notify_clock_out, CronTrigger(hour=17, minute=0, timezone=ET))
+    scheduler.add_job(notify_clock_in,  CronTrigger(day_of_week="mon-fri", hour=9,  minute=0, timezone=ET))
+    scheduler.add_job(notify_clock_out, CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone=ET))
     scheduler.start()
-    log.info("Scheduler started — reminders at 9:00am and 5:00pm ET.")
+    log.info("Scheduler started — reminders at 9:00am and 5:00pm ET, Monday–Friday.")
 
 
 # ---------------------------------------------------------------------------
