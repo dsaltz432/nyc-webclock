@@ -615,16 +615,19 @@ def tg_answer_callback(callback_query_id: str, text: str = "") -> None:
 
 def punch_keyboard(action: str) -> dict:
     """
-    Returns an inline keyboard with a single action button + Skip.
+    Returns an inline keyboard with the punch button and two snooze options.
     action: 'in' or 'out'
     """
-    label     = "Clock In" if action == "in" else "Clock Out"
-    punch_type = "TIME-IN" if action == "in" else "TIME-OUT"
+    label      = "Clock In" if action == "in" else "Clock Out"
+    punch_type = "TIME-IN"  if action == "in" else "TIME-OUT"
     return {
-        "inline_keyboard": [[
-            {"text": label,  "callback_data": f"punch:{punch_type}:{WEBHOOK_SECRET}"},
-            {"text": "Skip", "callback_data": "skip"},
-        ]]
+        "inline_keyboard": [
+            [{"text": label, "callback_data": f"punch:{punch_type}:{WEBHOOK_SECRET}"}],
+            [
+                {"text": "Snooze 30 min", "callback_data": f"snooze:{action}:30"},
+                {"text": "Snooze 60 min", "callback_data": f"snooze:{action}:60"},
+            ],
+        ]
     }
 
 
@@ -673,12 +676,37 @@ def notify_clock_out() -> None:
     )
 
 
+scheduler: BackgroundScheduler | None = None
+
+
 def start_scheduler() -> None:
+    global scheduler
     scheduler = BackgroundScheduler(timezone=ET)
-    scheduler.add_job(notify_clock_in,  CronTrigger(day_of_week="mon-fri", hour=9,  minute=0, timezone=ET))
+    scheduler.add_job(notify_clock_in,  CronTrigger(day_of_week="mon-fri", hour=9,  minute=0,  timezone=ET))
     scheduler.add_job(notify_clock_out, CronTrigger(day_of_week="mon-fri", hour=17, minute=15, timezone=ET))
     scheduler.start()
-    log.info("Scheduler started — reminders at 9:00am and 5:00pm ET, Monday–Friday.")
+    log.info("Scheduler started — reminders at 9:00am and 5:15pm ET, Monday–Friday.")
+
+
+def snooze_reminder(action: str, minutes: int) -> None:
+    """Fire a fresh punch notification after a snooze delay."""
+    label = "Clock In" if action == "in" else "Clock Out"
+    log.info("Sending snoozed %s reminder …", label)
+    tg_send(
+        f"⏰ Snoozed reminder — time to <b>{label.lower()}</b>.",
+        reply_markup=punch_keyboard(action),
+    )
+
+
+def schedule_snooze(action: str, minutes: int) -> None:
+    """Schedule a one-off snooze notification."""
+    if scheduler is None:
+        log.error("Scheduler not running — cannot schedule snooze.")
+        return
+    from datetime import datetime, timedelta
+    run_at = datetime.now(ET) + timedelta(minutes=minutes)
+    scheduler.add_job(snooze_reminder, "date", run_date=run_at, args=[action, minutes])
+    log.info("Snooze scheduled for %s in %d minutes.", action, minutes)
 
 
 # ---------------------------------------------------------------------------
@@ -789,8 +817,13 @@ def telegram_webhook(secret: str):
     callback_id = callback.get("id", "")
     data        = callback.get("data", "")
 
-    if data == "skip":
-        tg_answer_callback(callback_id, "Skipped.")
+    if data.startswith("snooze:"):
+        parts = data.split(":")
+        if len(parts) == 3:
+            action  = parts[1]  # 'in' or 'out'
+            minutes = int(parts[2])
+            schedule_snooze(action, minutes)
+            tg_answer_callback(callback_id, f"Snoozed {minutes} min.")
         return "", 200
 
     if data in ("test:in", "test:out"):
