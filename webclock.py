@@ -492,10 +492,13 @@ def do_punch(punch_type: str) -> dict:
     # Step 3: Submit punch
     # Use allow_redirects=False — a successful punch returns a 302 whose
     # Location header contains the server's confirmation message.
+    # Manually set IV_JCT — IBM Tivoli junction cookie, static value, not set by our login flow
+    session_r.cookies.set("IV_JCT", "%2Fctclock", domain="webclock.nyc.gov")
+
     punch_payload = {
         "X-TOKEN-CTWC": token or "null",
-        "actionType":   "",
-        "loggedTime":   logged_time or "",
+        "actionType":   "submit",
+        "loggedTime":   datetime.now(ET).strftime("%m/%d/%Y %H:%M"),
         "punchType":    punch_type,
     }
     log.info("Submitting %s punch with payload: %s", punch_type, punch_payload)
