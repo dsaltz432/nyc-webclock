@@ -703,7 +703,6 @@ def schedule_snooze(action: str, minutes: int) -> None:
     if scheduler is None:
         log.error("Scheduler not running — cannot schedule snooze.")
         return
-    from datetime import datetime, timedelta
     run_at = datetime.now(ET) + timedelta(minutes=minutes)
     scheduler.add_job(snooze_reminder, "date", run_date=run_at, args=[action, minutes])
     log.info("Snooze scheduled for %s in %d minutes.", action, minutes)
