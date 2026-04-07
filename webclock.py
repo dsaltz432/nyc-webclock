@@ -102,7 +102,7 @@ def init_db():
         log.error("Failed to initialise database: %s", exc)
 
 
-def record_punch(punch_type: str, success: bool, message: str):
+def record_punch(punch_type: str, message: str):
     if not DATABASE_URL:
         return
     try:
@@ -110,7 +110,7 @@ def record_punch(punch_type: str, success: bool, message: str):
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO punches (punch_type, success, message) VALUES (%s, %s, %s)",
-                    (punch_type, success, message),
+                    (punch_type, True, message),
                 )
     except Exception as exc:
         log.error("Failed to record punch: %s", exc)
@@ -533,28 +533,22 @@ def do_punch(punch_type: str) -> dict:
             wc_msg   = urllib.parse.parse_qs(parsed.query).get("wcMsg", [""])[0]
             message  = wc_msg if wc_msg else f"{punch_type} punch recorded successfully."
             result = {"success": True, "message": message, "timestamp": _now(), "punch_type": punch_type}
-            record_punch(punch_type, True, message)
+            record_punch(punch_type, message)
             return result
         else:
             # 302 to somewhere unexpected (e.g. logged out without confirmation)
-            result = {"success": False, "message": f"Unexpected redirect after punch: {location}", "timestamp": _now()}
-            record_punch(punch_type, False, result["message"])
-            return result
+            return {"success": False, "message": f"Unexpected redirect after punch: {location}", "timestamp": _now()}
 
     # 200 with empty body = server silently rejected (missing token/session state)
     if punch_resp.status_code == 200 and len(punch_resp.content) == 0:
-        result = {"success": False, "message": "Punch silently rejected by server (200 + empty body). Session or token issue.", "timestamp": _now()}
-        record_punch(punch_type, False, result["message"])
-        return result
+        return {"success": False, "message": "Punch silently rejected by server (200 + empty body). Session or token issue.", "timestamp": _now()}
 
     # Any other response — log it and treat as failure
-    result = {
+    return {
         "success": False,
         "message": f"Unexpected response: status={punch_resp.status_code} body={punch_resp.text[:200]}",
         "timestamp": _now(),
     }
-    record_punch(punch_type, False, result["message"])
-    return result
 
 
 # ---------------------------------------------------------------------------
