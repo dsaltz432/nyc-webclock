@@ -421,6 +421,9 @@ def do_punch(punch_type: str) -> dict:
     """
     Perform a full login + punch cycle using env var credentials.
     Returns a dict with keys: success (bool), message (str), timestamp (str).
+
+    Success is indicated by a 302 redirect whose Location header contains
+    the confirmation message from the server (e.g. "has been recorded").
     """
     punch_type = punch_type.upper()
     if punch_type not in VALID_PUNCH_TYPES:
@@ -440,11 +443,10 @@ def do_punch(punch_type: str) -> dict:
     session_r = requests.Session()
     session_r.verify = False  # webclock.nyc.gov uses a non-standard NYC gov CA chain
     session_r.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
+        "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection":      "keep-alive",
     })
 
     # Step 1: Login
@@ -463,14 +465,18 @@ def do_punch(punch_type: str) -> dict:
     except requests.RequestException as exc:
         return {"success": False, "message": f"Login request failed: {exc}", "timestamp": _now()}
 
-    log.info("Login response: %s — %s", login_resp.status_code, login_resp.url)
+    log.info("Login response: status=%s url=%s", login_resp.status_code, login_resp.url)
+    log.info("Login cookies: %s", dict(session_r.cookies))
 
-    # Step 2: Load clock page to get loggedTime + token
+    # Step 2: Load clock page (establishes session state, page is JS-rendered so body is empty)
     log.info("Loading Web Clock page …")
     try:
         clock_resp = session_r.get(CLOCK_PAGE_URL, allow_redirects=True, timeout=30)
     except requests.RequestException as exc:
         return {"success": False, "message": f"Failed to load clock page: {exc}", "timestamp": _now()}
+
+    log.info("Clock page: status=%s url=%s content-length=%s", clock_resp.status_code, clock_resp.url, len(clock_resp.content))
+    log.info("Clock page cookies: %s", dict(session_r.cookies))
 
     if "pkmslogin" in clock_resp.url.lower() or "login" in clock_resp.url.lower():
         return {
@@ -481,47 +487,73 @@ def do_punch(punch_type: str) -> dict:
 
     logged_time = _extract_field(clock_resp.text, "loggedTime")
     token       = _extract_field(clock_resp.text, "X-TOKEN-CTWC")
-    log.info("Clock page loaded. loggedTime=%s token=%s", logged_time, token)
+    log.info("Extracted: loggedTime=%r token=%r", logged_time, token)
 
     # Step 3: Submit punch
-    log.info("Submitting %s punch …", punch_type)
+    # Use allow_redirects=False — a successful punch returns a 302 whose
+    # Location header contains the server's confirmation message.
+    punch_payload = {
+        "X-TOKEN-CTWC": token or "null",
+        "actionType":   "",
+        "loggedTime":   logged_time or "",
+        "punchType":    punch_type,
+    }
+    log.info("Submitting %s punch with payload: %s", punch_type, punch_payload)
     try:
         punch_resp = session_r.post(
             SAVE_PUNCH_URL,
-            data={
-                "X-TOKEN-CTWC": token or "null",
-                "actionType":   "",
-                "loggedTime":   logged_time or "",
-                "punchType":    punch_type,
+            data=punch_payload,
+            headers={
+                "Referer": CLOCK_PAGE_URL,
+                "Origin":  BASE_URL,
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-User": "?1",
             },
-            allow_redirects=True,
+            allow_redirects=False,
             timeout=30,
         )
     except requests.RequestException as exc:
         return {"success": False, "message": f"Punch request failed: {exc}", "timestamp": _now()}
 
-    log.info("Punch response: %s — %s", punch_resp.status_code, punch_resp.url)
-    log.info("Punch response body (first 500 chars): %r", punch_resp.text[:500])
+    log.info("Punch response: status=%s", punch_resp.status_code)
+    log.info("Punch response headers: %s", dict(punch_resp.headers))
+    log.info("Punch response body: %r", punch_resp.text[:500])
 
-    body_lower = punch_resp.text.lower()
-    if "error" in body_lower and "punch" in body_lower:
-        error_detail = _extract_error(punch_resp.text)
-        result = {
-            "success": False,
-            "message": f"Punch may have failed. Server error: {error_detail}",
-            "timestamp": _now(),
-        }
+    # Success = 302 with a Location header containing the server's confirmation
+    if punch_resp.status_code == 302:
+        location = punch_resp.headers.get("location", "")
+        log.info("Punch redirect location: %s", location)
+        if "recorded" in location.lower() or "punch" in location.lower():
+            # Extract the human-readable message from the wcMsg query param
+            import urllib.parse
+            parsed   = urllib.parse.urlparse(location)
+            wc_msg   = urllib.parse.parse_qs(parsed.query).get("wcMsg", [""])[0]
+            message  = wc_msg if wc_msg else f"{punch_type} punch recorded successfully."
+            result = {"success": True, "message": message, "timestamp": _now(), "punch_type": punch_type}
+            record_punch(punch_type, True, message)
+            return result
+        else:
+            # 302 to somewhere unexpected (e.g. logged out without confirmation)
+            result = {"success": False, "message": f"Unexpected redirect after punch: {location}", "timestamp": _now()}
+            record_punch(punch_type, False, result["message"])
+            return result
+
+    # 200 with empty body = server silently rejected (missing token/session state)
+    if punch_resp.status_code == 200 and len(punch_resp.content) == 0:
+        result = {"success": False, "message": "Punch silently rejected by server (200 + empty body). Session or token issue.", "timestamp": _now()}
         record_punch(punch_type, False, result["message"])
         return result
 
+    # Any other response — log it and treat as failure
     result = {
-        "success":    True,
-        "message":    f"{punch_type} punch submitted successfully at {logged_time}.",
-        "timestamp":  _now(),
-        "logged_time": logged_time,
-        "punch_type":  punch_type,
+        "success": False,
+        "message": f"Unexpected response: status={punch_resp.status_code} body={punch_resp.text[:200]}",
+        "timestamp": _now(),
     }
-    record_punch(punch_type, True, result["message"])
+    record_punch(punch_type, False, result["message"])
     return result
 
 
