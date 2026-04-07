@@ -5,8 +5,8 @@ Automated clock in/out for NYC CityTime (webclock.nyc.gov). Runs on Railway as a
 ## What it does
 
 - Flask web app with a password-protected dashboard (Clock In / Clock Out buttons)
-- Sends Telegram notifications at 9am and 5pm ET, Monday–Friday, with inline buttons to clock in/out
-- Logs every punch attempt to a Postgres database
+- Sends Telegram notifications at 9:00am and 5:15pm ET, Monday–Friday, with inline buttons to clock in/out
+- Logs successful punches to a Postgres database
 - Scheduler and Telegram webhook run inside the same single-worker gunicorn process
 
 ## Stack
@@ -82,17 +82,28 @@ railway service nyc-webclock   # switch CLI context to the app service
 
 ## How the punch flow works
 
-1. Login POST to `https://webclock.nyc.gov/pkmslogin.form`
-2. GET `WebClockServlet` to establish session (page body is empty — JS-rendered, that's expected)
-3. POST to `SavePunchServlet` with `punchType=TIME-IN` or `TIME-OUT`
-4. SSL verification disabled (`verify=False`) — webclock.nyc.gov uses a non-standard NYC gov CA chain that Python can't verify in Docker
+1. **Login** — POST to `https://webclock.nyc.gov/pkmslogin.form` with credentials
+2. **Clock page** — GET `WebClockServlet` to establish session state (body is empty — JS-rendered, expected)
+3. **Punch** — POST to `SavePunchServlet` with the following payload:
+   - `punchType` — `TIME-IN` or `TIME-OUT`
+   - `actionType` — always `submit`
+   - `loggedTime` — current ET time in `MM/DD/YYYY HH:MM` format (generated locally, not fetched)
+   - `X-TOKEN-CTWC` — always `null` (server doesn't require a real token)
+4. **Success detection** — a successful punch returns a `302` redirect whose `Location` header contains the server confirmation message (e.g. `"Your 'Time In' punch at ... has been recorded"`). The app parses and returns this message. A `200` with empty body means the server silently rejected the punch.
+
+### Important implementation notes
+
+- **SSL verification disabled** (`verify=False`) — webclock.nyc.gov uses a non-standard NYC gov CA chain that Python can't verify in Docker
+- **`IV_JCT` cookie** — manually set to `%2Fctclock` before the punch. This is an IBM Tivoli junction cookie that the login flow doesn't set automatically but the server requires
+- **`allow_redirects=False`** on the punch POST — critical so we can inspect the 302 response rather than following it to an empty logout page
+- **Browser headers** — `Referer`, `Origin`, `Sec-Fetch-*` headers are sent to match a real browser request
 
 ## Notifications schedule
 
 - **9:00am ET Mon–Fri** — Clock In reminder
-- **5:00pm ET Mon–Fri** — Clock Out reminder
+- **5:15pm ET Mon–Fri** — Clock Out reminder
 - Scheduler uses APScheduler with `day_of_week="mon-fri"`
-- If the container restarts exactly at 9am or 5pm, that notification will be missed (rare)
+- If the container restarts exactly at notification time, that notification will be missed (rare)
 
 ## Database
 
@@ -108,7 +119,7 @@ CREATE TABLE punches (
 );
 ```
 
-Dashboard shows the 10 most recent punches. Table is created automatically on startup if it doesn't exist.
+Dashboard shows the 10 most recent **successful** punches. Table is created automatically on startup if it doesn't exist. Failed punches are not recorded.
 
 ## Testing without punching
 
@@ -120,7 +131,7 @@ The dashboard has a **Testing** section with two safe buttons:
 ## Common tasks
 
 ### Change notification times
-Edit `start_scheduler()` in `webclock.py`, update the `hour` values in the two `CronTrigger` calls, then deploy.
+Edit `start_scheduler()` in `webclock.py`, update the `hour`/`minute` values in the two `CronTrigger` calls, then deploy.
 
 ### Change to a different Telegram account
 Update `TELEGRAM_CHAT_ID` in Railway env vars. The webhook re-registers automatically on next deploy.
