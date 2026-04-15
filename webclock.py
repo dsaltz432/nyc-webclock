@@ -97,20 +97,24 @@ def init_db():
                         punched_at TIMESTAMPTZ  DEFAULT NOW()
                     )
                 """)
+                cur.execute("""
+                    ALTER TABLE punches
+                    ADD COLUMN IF NOT EXISTS source VARCHAR(20)
+                """)
         log.info("Database initialised.")
     except Exception as exc:
         log.error("Failed to initialise database: %s", exc)
 
 
-def record_punch(punch_type: str, message: str):
+def record_punch(punch_type: str, message: str, source: str = "unknown"):
     if not DATABASE_URL:
         return
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO punches (punch_type, success, message) VALUES (%s, %s, %s)",
-                    (punch_type, True, message),
+                    "INSERT INTO punches (punch_type, success, message, source) VALUES (%s, %s, %s, %s)",
+                    (punch_type, True, message, source),
                 )
     except Exception as exc:
         log.error("Failed to record punch: %s", exc)
@@ -123,7 +127,7 @@ def get_recent_punches(limit: int = 10) -> list:
         with get_db() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT punch_type, success, message,
+                    SELECT punch_type, success, message, source,
                            punched_at AT TIME ZONE 'America/New_York' AS punched_at
                     FROM punches
                     ORDER BY punched_at DESC
@@ -233,6 +237,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
   .badge-out { background: #fee2e2; color: #991b1b; }
   .badge-fail { background: #fef9c3; color: #854d0e; }
   .punch-time { color: #999; font-size: 0.8rem; }
+  .punch-source { font-size: 0.72rem; color: #aaa; margin-left: 0.4rem; }
   .logout { display: block; text-align: right; margin-top: 1.25rem;
             font-size: 0.8rem; color: #999; text-decoration: none; }
   .logout:hover { color: #555; }
@@ -320,9 +325,10 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
           timeZone: 'America/New_York', month: 'short', day: 'numeric',
           hour: '2-digit', minute: '2-digit'
         });
+        const source = p.source ? `<span class="punch-source">(${p.source})</span>` : '';
         return `<div class="punch-row">
           <span class="punch-badge ${badge}">${label}</span>
-          <span class="punch-time">${ts}</span>
+          <span class="punch-time">${ts}${source}</span>
         </div>`;
       }).join('');
     } catch { el.textContent = 'Could not load history.'; }
@@ -356,6 +362,37 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 </script>
 </body>
 </html>"""
+
+
+# ---------------------------------------------------------------------------
+# Punch safeguards
+# ---------------------------------------------------------------------------
+
+# TIME-IN is only allowed before 2pm ET; TIME-OUT is only allowed at/after 2pm ET.
+PUNCH_CUTOFF_HOUR = 14  # 2pm ET
+
+
+def _check_punch_allowed(punch_type: str) -> str | None:
+    """
+    Return a human-readable reason string if the punch should be blocked,
+    or None if it is allowed.
+    """
+    now_et = datetime.now(ET)
+    hour   = now_et.hour
+
+    if punch_type == "TIME-IN" and hour >= PUNCH_CUTOFF_HOUR:
+        return (
+            f"TIME-IN blocked: it is {now_et.strftime('%-I:%M %p')} ET — "
+            f"Clock In is not allowed after {PUNCH_CUTOFF_HOUR % 12}:00 PM."
+        )
+
+    if punch_type == "TIME-OUT" and hour < PUNCH_CUTOFF_HOUR:
+        return (
+            f"TIME-OUT blocked: it is {now_et.strftime('%-I:%M %p')} ET — "
+            f"Clock Out is not allowed before {PUNCH_CUTOFF_HOUR % 12}:00 PM."
+        )
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +454,7 @@ def do_verify() -> dict:
     }
 
 
-def do_punch(punch_type: str) -> dict:
+def do_punch(punch_type: str, source: str = "unknown") -> dict:
     """
     Perform a full login + punch cycle using env var credentials.
     Returns a dict with keys: success (bool), message (str), timestamp (str).
@@ -432,6 +469,14 @@ def do_punch(punch_type: str) -> dict:
             "message": f"Invalid punch type '{punch_type}'. Must be one of: {', '.join(sorted(VALID_PUNCH_TYPES))}",
             "timestamp": _now(),
         }
+
+    log.info("Punch triggered via: %s (type=%s)", source, punch_type)
+
+    block_reason = _check_punch_allowed(punch_type)
+    if block_reason:
+        log.warning("Punch blocked [source=%s]: %s", source, block_reason)
+        tg_send(f"⛔ <b>Punch blocked</b>\n{block_reason}")
+        return {"success": False, "message": block_reason, "timestamp": _now()}
 
     if not CITYTIME_USER or not CITYTIME_PASS:
         return {
@@ -536,7 +581,7 @@ def do_punch(punch_type: str) -> dict:
             wc_msg   = urllib.parse.parse_qs(parsed.query).get("wcMsg", [""])[0]
             message  = wc_msg if wc_msg else f"{punch_type} punch recorded successfully."
             result = {"success": True, "message": message, "timestamp": _now(), "punch_type": punch_type}
-            record_punch(punch_type, message)
+            record_punch(punch_type, message, source)
             return result
         else:
             # 302 to somewhere unexpected (e.g. logged out without confirmation)
@@ -796,7 +841,7 @@ def api_punch():
     if not punch_type:
         hour       = datetime.now(ET).hour
         punch_type = "TIME-IN" if hour < 12 else "TIME-OUT"
-    result      = do_punch(punch_type)
+    result      = do_punch(punch_type, source="dashboard")
     status_code = 200 if result["success"] else 500
     return jsonify(result), status_code
 
@@ -844,7 +889,7 @@ def telegram_webhook(secret: str):
         punch_type = parts[1]
         tg_answer_callback(callback_id, f"Submitting {punch_type}…")
 
-        result = do_punch(punch_type)
+        result = do_punch(punch_type, source="telegram")
         status_emoji = "✅" if result["success"] else "❌"
         tg_send(f"{status_emoji} {result['message']}")
         return "", 200
