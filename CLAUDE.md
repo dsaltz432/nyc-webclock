@@ -105,6 +105,10 @@ railway service nyc-webclock   # switch CLI context to the app service
 - Scheduler uses APScheduler with `day_of_week="mon-fri"`
 - If the container restarts exactly at notification time, that notification will be missed (rare)
 
+### Pausing reminders
+
+Send the bot `/pause`, `/resume`, or `/status` in Telegram (or tap the Pause/Resume button it replies with). Pause state is stored in the `settings` table (`key = 'notifications_paused'`), so it survives restarts. While paused, the 9am/5:15pm reminders and pending snoozes are skipped; the dashboard still works. Commands are only accepted from `TELEGRAM_CHAT_ID`.
+
 ## Database
 
 Single table `punches`:

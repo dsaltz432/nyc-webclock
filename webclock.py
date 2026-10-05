@@ -101,6 +101,12 @@ def init_db():
                     ALTER TABLE punches
                     ADD COLUMN IF NOT EXISTS source VARCHAR(20)
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key   VARCHAR(50) PRIMARY KEY,
+                        value TEXT
+                    )
+                """)
         log.info("Database initialised.")
     except Exception as exc:
         log.error("Failed to initialise database: %s", exc)
@@ -137,6 +143,43 @@ def get_recent_punches(limit: int = 10) -> list:
     except Exception as exc:
         log.error("Failed to fetch punch history: %s", exc)
         return []
+
+
+# In-memory fallback when no database is configured (lost on restart).
+_paused_fallback = False
+
+
+def is_paused() -> bool:
+    if not DATABASE_URL:
+        return _paused_fallback
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM settings WHERE key = 'notifications_paused'")
+                row = cur.fetchone()
+                return bool(row) and row[0] == "true"
+    except Exception as exc:
+        log.error("Failed to read pause state: %s", exc)
+        return False
+
+
+def set_paused(paused: bool) -> bool:
+    """Persist the pause state. Returns False if it could not be saved."""
+    global _paused_fallback
+    if not DATABASE_URL:
+        _paused_fallback = paused
+        return True
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO settings (key, value) VALUES ('notifications_paused', %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """, ("true" if paused else "false",))
+        return True
+    except Exception as exc:
+        log.error("Failed to save pause state: %s", exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +719,19 @@ def punch_keyboard(action: str) -> dict:
     }
 
 
+def pause_keyboard(paused: bool) -> dict:
+    """Single-button keyboard to flip the pause state."""
+    if paused:
+        return {"inline_keyboard": [[{"text": "▶️ Resume reminders", "callback_data": "resume"}]]}
+    return {"inline_keyboard": [[{"text": "⏸ Pause reminders", "callback_data": "pause"}]]}
+
+
+def pause_status_text(paused: bool) -> str:
+    if paused:
+        return "⏸ Reminders are <b>paused</b>. No clock in/out messages will be sent until you resume."
+    return "▶️ Reminders are <b>active</b> — 9:00am and 5:15pm ET, Monday–Friday."
+
+
 def register_telegram_webhook() -> None:
     """Register the Telegram webhook URL with the bot API."""
     if not TELEGRAM_BOT_TOKEN:
@@ -700,12 +756,29 @@ def register_telegram_webhook() -> None:
     except Exception as exc:
         log.error("Could not register Telegram webhook: %s", exc)
 
+    # Populate the bot's "/" command menu.
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/setMyCommands",
+            json={"commands": [
+                {"command": "pause",  "description": "Pause clock in/out reminders"},
+                {"command": "resume", "description": "Resume clock in/out reminders"},
+                {"command": "status", "description": "Show whether reminders are paused"},
+            ]},
+            timeout=10,
+        )
+    except Exception as exc:
+        log.error("Could not set Telegram bot commands: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Scheduler — 9am and 5pm ET notifications
 # ---------------------------------------------------------------------------
 
 def notify_clock_in() -> None:
+    if is_paused():
+        log.info("Reminders paused — skipping 9am Clock In reminder.")
+        return
     log.info("Sending 9am Clock In reminder …")
     tg_send(
         "Good morning! Time to <b>clock in</b>.",
@@ -714,6 +787,9 @@ def notify_clock_in() -> None:
 
 
 def notify_clock_out() -> None:
+    if is_paused():
+        log.info("Reminders paused — skipping 5pm Clock Out reminder.")
+        return
     log.info("Sending 5pm Clock Out reminder …")
     tg_send(
         "End of day — time to <b>clock out</b>.",
@@ -736,6 +812,9 @@ def start_scheduler() -> None:
 def snooze_reminder(action: str, minutes: int) -> None:
     """Fire a fresh punch notification after a snooze delay."""
     label = "Clock In" if action == "in" else "Clock Out"
+    if is_paused():
+        log.info("Reminders paused — skipping snoozed %s reminder.", label)
+        return
     log.info("Sending snoozed %s reminder …", label)
     tg_send(
         f"⏰ Snoozed reminder — time to <b>{label.lower()}</b>.",
@@ -853,6 +932,12 @@ def telegram_webhook(secret: str):
         return "", 403
 
     update = flask_request.get_json(silent=True) or {}
+
+    message = update.get("message")
+    if message:
+        handle_telegram_command(message)
+        return "", 200
+
     callback = update.get("callback_query")
 
     if not callback:
@@ -860,6 +945,15 @@ def telegram_webhook(secret: str):
 
     callback_id = callback.get("id", "")
     data        = callback.get("data", "")
+
+    if data in ("pause", "resume"):
+        paused = data == "pause"
+        if set_paused(paused):
+            tg_answer_callback(callback_id, "Reminders paused." if paused else "Reminders resumed.")
+            tg_send(pause_status_text(paused), reply_markup=pause_keyboard(paused))
+        else:
+            tg_answer_callback(callback_id, "Could not save — try again.")
+        return "", 200
 
     if data.startswith("snooze:"):
         parts = data.split(":")
@@ -895,6 +989,27 @@ def telegram_webhook(secret: str):
         return "", 200
 
     return "", 200
+
+
+def handle_telegram_command(message: dict) -> None:
+    """Handle /pause, /resume and /status text commands."""
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    if not TELEGRAM_CHAT_ID or chat_id != str(TELEGRAM_CHAT_ID):
+        return  # ignore anyone other than the configured user
+
+    # "/pause@MyBot extra" -> "/pause"
+    text    = (message.get("text") or "").strip()
+    command = text.split()[0].split("@")[0].lower() if text else ""
+
+    if command in ("/pause", "/resume"):
+        paused = command == "/pause"
+        if set_paused(paused):
+            tg_send(pause_status_text(paused), reply_markup=pause_keyboard(paused))
+        else:
+            tg_send("❌ Could not save the pause setting — try again.")
+    elif command in ("/status", "/start"):
+        paused = is_paused()
+        tg_send(pause_status_text(paused), reply_markup=pause_keyboard(paused))
 
 
 # ---------------------------------------------------------------------------
